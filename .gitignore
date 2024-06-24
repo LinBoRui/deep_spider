@@ -1,2 +1,5 @@
 .vscode
 poetry.lock
+
+saved
+logs

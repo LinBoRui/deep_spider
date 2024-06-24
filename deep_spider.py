@@ -1,210 +1,223 @@
 from bs4 import BeautifulSoup
 from urllib.parse import *
+import requests
 import aiohttp
 import asyncio
-import requests
 import os
+import shutil
 
-user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36"
-accept = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9'
 
-def ensure_future(func):
-    def wrapper(*args, **kwargs):
-        return asyncio.ensure_future(func(*args, **kwargs))
-    return wrapper
+def main():
+    url = input('url: ')
+    folder = input('folder: ')
+    selectors = ['a', 'link', 'script', 'img', 'meta']
+    attributes = ['href', 'src', 'content']
+    
+    print()
+    
+    ds = deep_spider(url, folder=folder, print_mode=True, log_mode=True)
+    ds.deep_select(selectors, attributes)
 
-@ensure_future
-async def get(url: str) -> bytes:
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit_per_host=10)) as session:
-        async with session.get(url, headers={'user-agent': user_agent, 'accept': accept}) as res:
-            return await res.read()
+    print('Download complete!')
 
-def run_async(tasks: list) -> list:
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(asyncio.wait(tasks))
-    return [t.result() for t in tasks]
 
 
 class deep_spider:
-    def __init__(self, url: str, folder: str = None, print_mode: bool = False, log_mode: bool = False, selectors: list[str] = None, select_attributes: list[str] = None):
-        response = requests.get(url)
-        self.url = response.url
-        if self.url[-1] == '/':
-            self.url += 'index.html'
-        elif self.url[-5:] != '.html':
-            self.url += '/index.html'
-        self.url_folder = self.url[:self.url.rfind('/')+1]
-        self.parse = urlparse(self.url_folder)
-        self.soup = BeautifulSoup(response.text, 'lxml')
+    
+    html_parser = 'lxml'
+    top_folder = 'saved'
+    log_folder = 'logs'
+    link_attr = {'href'}
+    paths = set()
+    select_same_netloc = True
+    select_same_paths = False
+    file_exts = {'.html', '.css', '.js', '.svg', '.png', '.jpg', 'ico'}
 
-        self.url_set = {self.url}
-        self.deep_url_set = set()
-        self.tasks = []
-        self.paths = []
-
-        if not folder:
-            folder = './html/'
-        folder += '/' if folder[-1] != '/' else ''
-        if not os.path.exists(folder):
+    @staticmethod
+    def __check_folder(path: str) -> str:
+        folder = os.path.dirname(path)
+        if folder and not os.path.exists(folder):
             os.makedirs(folder)
-        self.folder = folder
+        return folder
+    
+    @classmethod
+    def __path_correction(cls,
+                          path: str,
+                          olds: tuple = (':', '*', '?', '"', '<', '>', '|'),
+                          new: str = '_',
+                        ) -> str:
+        path = path.replace('\\', '/')
+        while path.find('//') != -1:
+            path = path.replace('//', '/')
+        for old in olds:
+            path = path.replace(old, new)
+        return path
 
+
+    def __init__(self,
+                 url: str,
+                 folder: str = 'spider',
+                 print_mode: bool = False,
+                 log_mode: bool = False,
+                ) -> None:
+        response = requests.get(url)
+        url = response.url
+        url = url.replace('\\', '/')
+        parse = urlparse(url)._replace(query='', fragment='')
+        if not parse.path.endswith('.html') or not parse.path.endswith('/'):
+            parse = parse._replace(path=os.path.join(parse.path, '/'))
+        url = urlunparse(parse)
+        url_dirname = os.path.dirname(url)
+        self.parse_dir = urlparse(url_dirname)
+        
+        self.folder = os.path.join(self.top_folder, folder)
+        if os.path.exists(self.folder):
+            shutil.rmtree(self.folder)
+        
         self.print_mode = print_mode
+        
         self.log_mode = log_mode
         if log_mode:
-            self.log_filename = self.folder.replace('/', '_') + 'log.txt'
-        self.selectors = selectors if selectors else ['link', 'script', 'img']
-        self.select_attributes = select_attributes if select_attributes else ['href', 'src']
-
-        self.download(self.url, self.soup)
-        self.start_download()
-
-    def start_download(self):
-        if not self.tasks:
-            return
-        datas = run_async(self.tasks)
-        self.tasks.clear()
-        for path, data in zip(self.paths, datas):
-            i = path.rfind('/')
-            if i > 0:
-                if not os.path.exists(path[:i]):
-                    os.makedirs(path[:i])
-            with open(path, 'wb') as f:
-                f.write(data)
-        self.paths.clear()
-
-    def deep_select(self, selector: str, url: str = None, soup: BeautifulSoup = None):
-        if url is None:
-            url = self.url
-        if soup is None:
-            soup = BeautifulSoup(requests.get(url).text, 'lxml')
-
-        urls = []
-        for sel in soup.select(selector, href=True):
-            if not sel.has_attr('href'):
-                continue
-            href = self._url_correct(sel['href'], url)
-            if href in self.url_set or self.parse.netloc != urlparse(href).netloc:
-                continue
-            self.url_set.add(href)
-            
-            urls.append(href)
-            self.tasks.append(get(href))
-
-        if not self.tasks:
-            return
-
-        htmls = run_async(self.tasks)
-        self.tasks.clear()
-
-        soups = []
-        for url, html in zip(urls, htmls):
-            try:
-                bs = BeautifulSoup(html.decode(encoding='utf-8'), 'lxml')
-                soups.append(bs)
-                self.download(url, bs)
-            except:
-                with open(self.folder + self.get_filepath(url)[0], 'wb') as f:
-                    f.write(html)
-        self.start_download()
+            self.log_filepath = os.path.join(self.log_folder, self.__path_correction(folder, new='').replace('/', '_') + '_log.txt')
+            if os.path.exists(self.log_filepath):
+                os.remove(self.log_filepath)
         
-        for url, soup in zip(urls, soups):
-            self.deep_select(selector, url, soup)
-
-    def get_filepath(self, url: str) -> (str, str):
-        parse = urlparse(url)
-        if parse.netloc == self.parse.netloc and parse.path.find(self.parse.path) == 0:
-            if self.parse.path != '/':
-                filepath = parse.path.replace(self.parse.path, '')
-            else:
-                filepath = parse.path[1:]
-        else:
-            filepath = parse.netloc + parse.path
-        filepath = filepath.replace(':', '_')
-        url = url[:url.find(parse.path)+len(parse.path)]
-
-        folder = ''
-        if '/' in filepath:
-            folder = filepath[:filepath.rfind('/')]
-            if not os.path.exists(self.folder + folder):
-                os.makedirs(self.folder + folder)
-        return filepath, folder
-
-
-    def download(self, url: str = None, soup: BeautifulSoup = None):
-        if url is None:
-            url = self.url
-        if soup is None:
-            soup = BeautifulSoup(requests.get(url).text, 'lxml')
-
-        filepath, folder = self.get_filepath(url)
-
-        for sel in self.selectors:
-            for set in soup.select(sel):
-                for attr in self.select_attributes:
-                    if set.has_attr(attr) and not set[attr].startswith('data:') and not set[attr].startswith('http'):
-                        set[attr] = self._single_download(set[attr], url, folder)
-
-        with open(self.folder + filepath, 'wb') as f:
-            f.write(str(soup).encode('utf8'))
-
-
-    def _single_download(self, url_curr: str, url_base: str, folder: str) -> str:
-        url = self._url_correct(url_curr, url_base)
-        parse = urlparse(url)
-        if parse.netloc == self.parse.netloc and parse.path.find(self.parse.path) == 0:
-            if self.parse.path != '/':
-                filename = parse.path.replace(self.parse.path, '')
-            else:
-                filename = parse.path[1:]
-        else:
-            filename = parse.netloc + parse.path
-        filename = filename.replace(':', '_')
-        path = os.path.relpath('C:/'+filename+url[url.find(parse.path)+len(parse.path):], 'C:/'+folder)
-        url = url[:url.find(parse.path)+len(parse.path)]
-
-        if not url:
-            return url_curr
-        if url in self.url_set:
-            return path
-        if url in self.deep_url_set:
-            return path
-        self.deep_url_set.add(url)
-
-        self.tasks.append(get(url))
-        self.paths.append(self.folder + filename)
-
-        if self.print_mode:
-            print(url)
-        if self.log_mode:
-            with open(self.log_filename, 'a') as f:
-                f.write(url + '\n')
-
-        return path
+        self.__init_urls()
+        self.urls['htmls'].append(url)
+        self.urls['path'][parse.netloc] = {}
+        self.urls['path'][parse.netloc][parse.path] = self.__parse_to_path(parse)
+        self.async_req = async_request()
+        
+        if print_mode:
+            print('url', url)
+            print('folder:', self.folder)
+            print('path:', self.urls['path'][parse.netloc][parse.path])
     
-    def _url_correct(self, url: str, url_base: str) -> str:
-        file_ext = ['.html', '.css', '.js', '.svg', '.png', '.jpg']
-        if not url:
-            return url
-        url = url.replace('\\', '/')
+    def deep_select(self,
+                    selectors: list = ['a', 'link'],
+                    attributes: list = ['href', 'src'],
+                    ) -> None:
+        while self.urls['htmls']:
+            url_curr = self.urls['htmls'].pop()
+            response = requests.get(url_curr)
+            soup = BeautifulSoup(response.text, self.html_parser)
+            for selector in selectors:
+                for element in soup.select(selector):
+                    for attr in attributes:
+                        if not attr in element.attrs:
+                            continue
+                        parse = urlparse(urljoin(url_curr, element[attr]))
+                        if os.path.splitext(parse.path)[1] == '' and not attr in self.link_attr and not parse.path[-1] in {'/', '\\'}:
+                            continue
+                        if parse.netloc not in self.urls['path']:
+                            self.urls['path'][parse.netloc] = {}
+                        if parse.path in self.urls['path'][parse.netloc]:
+                            element[attr] = self.urls['path'][parse.netloc][parse.path] + parse.query + parse.fragment
+                            continue
+                        self.__url_append(urlunparse(parse._replace(query='', fragment='')))
+                        path = self.__parse_to_path(parse)
+                        element[attr] = path + parse.query + parse.fragment
+            
+            if self.urls['elements']:
+                datas = self.async_req.start_async(self.urls['tasks'])
+                for url_elem, data in zip(self.urls['elements'], datas):
+                    parse = urlparse(url_elem)
+                    self.__save_data(url_elem, self.urls['path'][parse.netloc][parse.path], data)
+                self.urls['elements'].clear()
+                self.urls['tasks'].clear()
+            
+            if self.print_mode:
+                parse = urlparse(url_curr)
+                print(f'{url_curr} -> {self.urls["path"][parse.netloc][parse.path]}')
+            
+            self.__save_data(url_curr, self.urls['path'][parse.netloc][parse.path], str(soup).encode())
+    
+    
+    def __init_urls(self):
+        self.urls = {}
+        self.urls['path'] = {}
+        self.urls['htmls'] = []
+        self.urls['elements'] = []
+        self.urls['tasks'] = []
+    
+    def __url_append(self, url: str) -> None:
         parse = urlparse(url)
-        if parse.scheme == '':
-            url = urljoin(url_base, url)
-            parse = urlparse(url)
-        for ext in file_ext:
-            if ext in url:
-                return url
-        index = '/index.html' if parse.path == '' or parse.path[-1] != '/' else 'index.html'
-        url = urlunparse(parse._replace(path = parse.path + index))
-        return url
+        if os.path.splitext(url)[1] in {'', '.html'}:
+            if not self.select_same_netloc or parse.netloc == self.parse_dir.netloc:
+                if not self.select_same_paths or parse.path.find(self.parse_dir.path) == 0:
+                    self.urls['htmls'].append(url)
+                    return
+
+        self.urls['elements'].append(url)
+        self.urls['tasks'].append(async_request.get(url))
+
+    def __save_data(self, url: str, path: str, data: bytes) -> None:
+        path = os.path.join(self.folder, path)
+        self.__check_folder(path)
+        
+        if self.log_mode:
+            with open(self.log_filepath, 'a') as f:
+                f.write(f'{url} -> {path}\n')
+        
+        with open(path, 'wb') as f:
+            f.write(data)
+
+    def __parse_to_path(self, parse: ParseResult) -> str:
+        if parse.netloc not in self.urls['path']:
+            self.urls['path'][parse.netloc] = {}
+        if parse.path in self.urls['path'][parse.netloc]:
+            return self.urls['path'][parse.netloc][parse.path]
+        
+        if parse.netloc == self.parse_dir.netloc and parse.path.find(self.parse_dir.path) == 0:
+            path = parse.path.replace(self.parse_dir.path, '', 1)
+        else:
+            path = parse.netloc + parse.path
+        
+        if os.path.splitext(path)[1] not in self.file_exts:
+            path = os.path.join(path, 'index.html')
+        
+        while path.startswith('/') or path.startswith('\\'):
+            path = path[1:]
+        
+        path = self.__path_correction(path)
+        
+        self.urls['path'][parse.netloc][parse.path] = path
+        return path
+
+
+
+class async_request:
+    
+    host_num = 10
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36"
+    accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9"
+
+    @staticmethod
+    def __ensure_future(func):
+        def wrapper(*args, **kwargs):
+            return asyncio.ensure_future(func(*args, **kwargs))
+        return wrapper
+
+    @classmethod
+    @__ensure_future
+    async def get(cls, url: str) -> bytes:
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit_per_host=cls.host_num)) as session:
+            async with session.get(url, headers={'user-agent': cls.user_agent, 'accept': cls.accept}) as res:
+                return await res.read()
+
+    @staticmethod
+    def start_async(tasks: list) -> list:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(asyncio.wait(tasks))
+        result = []
+        for t in tasks:
+            try:
+                r = t.result()
+            except:
+                r = b'Error: 404 Not Found\n'
+            result.append(r)
+        return result
 
 
 if __name__ == '__main__':
-    url = input('url: ')
-    foldername = input('folder name: ')
-    selectors = ['link', 'script', 'a', 'img']
-    attributes = ['href', 'src']
-    selector = 'a'
-
-    ds = deep_spider(url, folder=foldername, log_mode=True, selectors=selectors, select_attributes=attributes)
-    ds.deep_select(selector)
+    main()
